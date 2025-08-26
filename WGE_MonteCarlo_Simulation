@@ -1,0 +1,147 @@
+# -----------------------------------------
+# Monte Carlo Simulation: WGE Distribution
+# -----------------------------------------
+
+# Load required libraries
+install.packages("coda")
+library(coda)
+
+# True parameters and simulation settings
+alpha_true <- 1.5
+beta_true <- 0.6
+lambda_true <- 2
+n <- 250           # Sample size
+Nsim <- 100        # Number of simulations
+N_mcmc <- 20000    # MCMC iterations per simulation
+burn_in <- 5000
+thin_step <- 5
+a_linex <- 0.3
+
+# --- Generate WGE samples ---
+rWGE <- function(n, alpha, beta, lambda) {
+  u <- runif(n)
+  (1 / lambda) * log(1 + (-log(1 - u) / alpha)^(1 / beta))
+}
+
+# --- Log-likelihood function ---
+logLikWGE <- function(params, data) {
+  alpha <- params[1]
+  beta <- params[2]
+  lambda <- params[3]
+  if (any(params <= 0)) return(-1e10)
+  
+  ex <- exp(lambda * data)
+  one_minus_exp_neg <- 1 - exp(-lambda * data)
+  u <- ex - 1
+  if (any(one_minus_exp_neg <= 0) || any(u <= 0)) return(-1e10)
+  
+  ll <- log(alpha) + log(beta) + log(lambda) +
+        (beta - 1) * log(one_minus_exp_neg) +
+        lambda * beta * data - alpha * (u)^beta
+  sum(ll)
+}
+
+# --- Negative log-likelihood for optim ---
+negLogLik <- function(params, data) -logLikWGE(params, data)
+
+# --- MCMC sampler function ---
+run_MCMC <- function(x, N, init_params, a0=1, b0=1, c0=1, d0=1, e0=1, f0=1) {
+  alpha <- init_params[1]
+  beta <- init_params[2]
+  lambda <- init_params[3]
+  
+  alpha_s <- numeric(N)
+  beta_s <- numeric(N)
+  lambda_s <- numeric(N)
+  
+  accept <- 0
+  
+  for (i in 1:N) {
+    alpha_p <- abs(rnorm(1, alpha, 0.1))
+    beta_p <- abs(rnorm(1, beta, 0.1))
+    lambda_p <- abs(rnorm(1, lambda, 0.1))
+    
+    prior_curr <- dgamma(alpha, a0, b0, log=TRUE) + dgamma(beta, c0, d0, log=TRUE) + dgamma(lambda, e0, f0, log=TRUE)
+    prior_prop <- dgamma(alpha_p, a0, b0, log=TRUE) + dgamma(beta_p, c0, d0, log=TRUE) + dgamma(lambda_p, e0, f0, log=TRUE)
+    
+    ll_curr <- logLikWGE(c(alpha, beta, lambda), x)
+    ll_prop <- logLikWGE(c(alpha_p, beta_p, lambda_p), x)
+    
+    log_acc_ratio <- (ll_prop + prior_prop) - (ll_curr + prior_curr)
+    
+    if (log(runif(1)) < log_acc_ratio) {
+      alpha <- alpha_p
+      beta <- beta_p
+      lambda <- lambda_p
+      accept <- accept + 1
+    }
+    
+    alpha_s[i] <- alpha
+    beta_s[i] <- beta
+    lambda_s[i] <- lambda
+  }
+  
+  list(alpha=alpha_s, beta=beta_s, lambda=lambda_s, acceptance_rate=accept/N)
+}
+
+# --- Storage matrices ---
+mle_results <- matrix(NA, nrow=Nsim, ncol=3)
+bayes_SE_results <- matrix(NA, nrow=Nsim, ncol=3)
+bayes_Linex_results <- matrix(NA, nrow=Nsim, ncol=3)
+alpha_CI_mat <- matrix(NA, nrow=Nsim, ncol=2)
+beta_CI_mat <- matrix(NA, nrow=Nsim, ncol=2)
+lambda_CI_mat <- matrix(NA, nrow=Nsim, ncol=2)
+
+set.seed(2025)
+
+for (sim in 1:Nsim) {
+  x <- rWGE(n, alpha_true, beta_true, lambda_true)
+  
+  # MLE estimation
+  start_params <- c(1,1,1)
+  fit <- optim(start_params, negLogLik, data=x, method="L-BFGS-B",
+               lower=c(1e-5,1e-5,1e-5), upper=c(10,10,10),
+               control=list(maxit=10000))
+  mle_est <- fit$par
+  mle_results[sim,] <- mle_est
+  
+  # Bayesian MCMC
+  mcmc_out <- run_MCMC(x, N_mcmc, init_params = mle_est)
+  
+  # Burn-in and thinning
+  alpha_post <- mcmc_out$alpha[(burn_in+1):N_mcmc][seq(1, N_mcmc-burn_in, by=thin_step)]
+  beta_post <- mcmc_out$beta[(burn_in+1):N_mcmc][seq(1, N_mcmc-burn_in, by=thin_step)]
+  lambda_post <- mcmc_out$lambda[(burn_in+1):N_mcmc][seq(1, N_mcmc-burn_in, by=thin_step)]
+  
+  # Bayesian estimates
+  bayes_SE_results[sim,] <- c(mean(alpha_post), mean(beta_post), mean(lambda_post))
+  bayes_Linex_results[sim,] <- c(
+    -1/a_linex * log(mean(exp(-a_linex*alpha_post))),
+    -1/a_linex * log(mean(exp(-a_linex*beta_post))),
+    -1/a_linex * log(mean(exp(-a_linex*lambda_post)))
+  )
+  
+  alpha_CI_mat[sim,] <- quantile(alpha_post, c(0.025, 0.975))
+  beta_CI_mat[sim,] <- quantile(beta_post, c(0.025, 0.975))
+  lambda_CI_mat[sim,] <- quantile(lambda_post, c(0.025, 0.975))
+  
+  if(sim %% 10 == 0) cat("Simulation", sim, "done\n")
+}
+
+# --- Bias and MSE function ---
+calc_bias_mse <- function(estimates, true_vals) {
+  bias <- colMeans(estimates) - true_vals
+  mse <- colMeans((estimates - matrix(true_vals, nrow=nrow(estimates), ncol=3, byrow=TRUE))^2)
+  list(bias=bias, mse=mse)
+}
+
+mle_stats <- calc_bias_mse(mle_results, c(alpha_true, beta_true, lambda_true))
+bayes_SE_stats <- calc_bias_mse(bayes_SE_results, c(alpha_true, beta_true, lambda_true))
+bayes_Linex_stats <- calc_bias_mse(bayes_Linex_results, c(alpha_true, beta_true, lambda_true))
+
+# --- Print Results ---
+cat("=== MLE Results ===\n")
+cat("Bias:", round(mle_stats$bias,6), "\n")
+cat("MSE:", round(mle_stats$mse,6), "\n")
+
+cat("\n=== Bayesian SE Results ===
